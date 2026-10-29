@@ -106,6 +106,65 @@ def call_panel_api(action, payload=None):
     return None
 
 # ------------------------------------------------------------
+# 1b. SMM Provider API Direct Dispatch (ig grow bot / SMM Raja)
+# ------------------------------------------------------------
+_cached_panel_settings = None
+_cached_settings_time = 0
+
+def get_live_bot_settings():
+    global _cached_panel_settings, _cached_settings_time
+    now = time.time()
+    if _cached_panel_settings and (now - _cached_settings_time < 60):
+        return _cached_panel_settings
+    res = call_panel_api("api_settings")
+    if res and res.get('ok'):
+        _cached_panel_settings = res
+        _cached_settings_time = now
+        return res
+    return _cached_panel_settings or {
+        'provider_api_url': 'https://iggrowbot.com/api/v2',
+        'provider_api_key': '0d455a8f8578e1eadcb3fbe92e3bd364',
+        'api_service_id': '2396',
+        'min_quantity': 500
+    }
+
+def call_provider_api(link, quantity):
+    cfg = get_live_bot_settings()
+    url = cfg.get('provider_api_url') or 'https://iggrowbot.com/api/v2'
+    key = cfg.get('provider_api_key') or '0d455a8f8578e1eadcb3fbe92e3bd364'
+    svc_id = str(cfg.get('api_service_id') or '2396')
+    min_q = int(cfg.get('min_quantity') or 500)
+
+    # Provider minimum quantity safety (iggrowbot service 2396 requires min 500)
+    send_qty = max(quantity, min_q)
+    if svc_id == '2396' and send_qty < 500:
+        send_qty = 500
+
+    try:
+        post_data = urllib.parse.urlencode({
+            'key': key,
+            'action': 'add',
+            'service': svc_id,
+            'link': link,
+            'quantity': send_qty
+        }).encode('utf-8')
+        req = urllib.request.Request(
+            url,
+            data=post_data,
+            headers={
+                'User-Agent': 'OrganicReachExperts-API-Client/2.0',
+                'Content-Type': 'application/x-www-form-urlencoded'
+            }
+        )
+        with urllib.request.urlopen(req, timeout=15) as res:
+            raw = res.read().decode('utf-8', errors='ignore')
+            print(f"📦 Provider API Response: {raw}", flush=True)
+            return json.loads(raw)
+    except Exception as e:
+        print(f"⚠️ Provider API Dispatch Error: {e}", flush=True)
+        return {"error": str(e)}
+
+# ------------------------------------------------------------
 # 2. Local Database Initialization (Cache & Fallback)
 # ------------------------------------------------------------
 def init_db():
@@ -512,7 +571,7 @@ def process_update(update):
             h_res = call_panel_api("api_history", {"telegram_id": user['telegram_id']})
             orders = h_res.get('orders', []) if h_res else []
 
-            text = "📜 <b>Order History</b>\n\n"
+            text = "📋 <b>Your Orders History</b>\n\n"
             if not orders:
                 text += "You haven't placed any orders yet!\nClick <b>Place New Order</b> to boost your Instagram reels."
             else:
@@ -521,10 +580,26 @@ def process_update(update):
                     st = ord.get('status', 'Processing')
                     qty = ord.get('quantity', 0)
                     lnk = ord.get('link', '')
-                    text += f"📦 <b>#{ord['id']}</b> | <b>{qty:,} Views</b>\n"
-                    text += f"Status: <b>{st}</b> | Date: <code>{dt}</code>\n"
-                    text += f"Link: <a href=\"{lnk}\">View Link</a>\n\n"
-            tg_edit_message(chat_id, msg_id, text, kb_back())
+                    api_id = ord.get('api_order_id')
+
+                    st_lower = str(st).lower()
+                    icon = "⏳"
+                    if "complete" in st_lower:
+                        icon = "✅"
+                    elif "cancel" in st_lower or "fail" in st_lower:
+                        icon = "❌"
+                    elif "progress" in st_lower or "processing" in st_lower:
+                        icon = "🔄"
+
+                    text += f"📦 <b>Order #{ord['id']}</b>" + (f" <i>(API: #{api_id})</i>" if api_id else "") + "\n"
+                    text += f"⚡ <b>{qty:,} Views</b> &bull; Status: {icon} <b>{st}</b>\n"
+                    text += f"📅 <code>{dt[:16]}</code>\n"
+                    text += f"🔗 <a href=\"{lnk}\">View Reel</a>\n\n"
+
+            tg_edit_message(chat_id, msg_id, text, [
+                [{"text": "📦 Place New Order", "callback_data": "menu_order_select"}],
+                [{"text": "🏠 Main Menu", "callback_data": "menu_main"}]
+            ])
             return
 
     # B. Text Messages
@@ -597,21 +672,29 @@ def process_update(update):
             # 1. Intermediate status message (Exact match to Image 1)
             tg_send_message(chat_id, "⏳ Processing your order with API, please wait...")
 
-            # 2. Place Order via Live MySQL & SMM Provider API
+            # 2. Dispatch directly to Provider API (ig grow bot / SMM Raja)
+            prov_res = call_provider_api(link, qty)
+            api_order_id = None
+            if prov_res and (prov_res.get('order') or prov_res.get('success')):
+                api_order_id = str(prov_res.get('order', ''))
+
+            # 3. Place Order via Live MySQL Panel & Deduct User Credits
             ord_res = call_panel_api("api_place_order", {
                 "telegram_id": user['telegram_id'],
                 "quantity": qty,
-                "link": link
+                "link": link,
+                "api_order_id": api_order_id,
+                "api_response": prov_res
             })
 
             if ord_res and ord_res.get('ok'):
                 bot_ord_id = ord_res.get('bot_order_id')
             else:
-                bot_ord_id = int(time.time())
+                bot_ord_id = api_order_id or int(time.time())
 
             update_user_state(user['telegram_id'], 'idle', 0)
 
-            # 3. Exact success receipt and buttons matching Image 1
+            # 4. Exact success receipt and buttons matching Image 1
             success_text = (
                 "✅ <b>Order Placed Successfully!</b>\n\n"
                 f"🆔 <b>Order ID:</b> <code>{bot_ord_id}</code>\n"
