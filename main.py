@@ -480,11 +480,8 @@ def process_update(update):
 
             update_user_state(user['telegram_id'], 'waiting_for_link', qty)
             text = (
-                "🔗 <b>Send Your Instagram Link</b>\n\n"
-                f"Selected Quantity: <b>{qty:,} Reels Views</b>\n"
-                f"Credits Required: <b>{qty:,} Credits</b>\n\n"
-                "Please send your public Instagram Reel or Video link now 👇\n"
-                "<i>Example: https://www.instagram.com/reel/C3abc123/</i>"
+                f"🎯 <b>Selected Package:</b> {qty:,} views.\n\n"
+                "🔗 Now, send your target <b>Instagram reel/video link</b> in the chat:"
             )
             tg_edit_message(chat_id, msg_id, text, [
                 [{"text": "❌ Cancel", "callback_data": "cancel_order"}]
@@ -577,11 +574,8 @@ def process_update(update):
 
             update_user_state(user['telegram_id'], 'waiting_for_link', qty)
             text = (
-                "🔗 <b>Send Your Instagram Link</b>\n\n"
-                f"Selected Quantity: <b>{qty:,} Reels Views</b>\n"
-                f"Credits Required: <b>{qty:,} Credits</b>\n\n"
-                "Please send your public Instagram Reel or Video link now 👇\n"
-                "<i>Example: https://www.instagram.com/reel/C3abc123/</i>"
+                f"🎯 <b>Selected Package:</b> {qty:,} views.\n\n"
+                "🔗 Now, send your target <b>Instagram reel/video link</b> in the chat:"
             )
             tg_send_message(chat_id, text, [
                 [{"text": "❌ Cancel", "callback_data": "cancel_order"}]
@@ -600,7 +594,10 @@ def process_update(update):
             if qty < 100:
                 qty = 100
 
-            # Place Order via Live MySQL & SMM Provider API
+            # 1. Intermediate status message (Exact match to Image 1)
+            tg_send_message(chat_id, "⏳ Processing your order with API, please wait...")
+
+            # 2. Place Order via Live MySQL & SMM Provider API
             ord_res = call_panel_api("api_place_order", {
                 "telegram_id": user['telegram_id'],
                 "quantity": qty,
@@ -609,28 +606,21 @@ def process_update(update):
 
             if ord_res and ord_res.get('ok'):
                 bot_ord_id = ord_res.get('bot_order_id')
-                new_bal = ord_res.get('new_balance', user['credits'] - qty)
             else:
-                # Local fallback
                 bot_ord_id = int(time.time())
-                new_bal = user['credits'] - qty
 
             update_user_state(user['telegram_id'], 'idle', 0)
 
+            # 3. Exact success receipt and buttons matching Image 1
             success_text = (
                 "✅ <b>Order Placed Successfully!</b>\n\n"
-                f"📦 <b>Order ID:</b> #{bot_ord_id}\n"
-                "⚡ <b>Service:</b> Instagram Reels Views\n"
-                f"🔢 <b>Quantity:</b> {qty:,} Views\n"
-                f"💰 <b>Credits Deducted:</b> {qty:,}\n"
-                f"💳 <b>Remaining Balance:</b> {new_bal:,} Credits\n"
-                f"🔗 <b>Target:</b> {link}\n\n"
-                "🚀 <i>Your views delivery has started and will be delivered shortly!</i>"
+                f"🆔 <b>Order ID:</b> <code>{bot_ord_id}</code>\n"
+                f"📦 <b>Quantity:</b> {qty:,} views\n\n"
+                "🔥 Want a faster experience? Manage your orders and earn more credits directly on our Android App!"
             )
             tg_send_message(chat_id, success_text, [
-                [{"text": "📦 Place Another Order", "callback_data": "menu_order_select"}],
-                [{"text": "📜 Order History", "callback_data": "menu_history"}],
-                [{"text": "🏠 Main Menu", "callback_data": "menu_main"}]
+                [{"text": "🛒 Buy More on Organic Reach Panel ↗", "url": PANEL_WEB_URL}],
+                [{"text": "📦 Place Another Order", "callback_data": "menu_order_select"}, {"text": "🏠 Main Menu", "callback_data": "menu_main"}]
             ])
             return
 
