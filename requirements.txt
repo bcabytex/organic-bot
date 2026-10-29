@@ -1,1 +1,1 @@
-# Zero external dependencies required - runs on pure Python standard library
+cryptography

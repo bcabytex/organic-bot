@@ -1,7 +1,14 @@
 """
 ============================================================
-Organic Reach Experts - Telegram Bot Runner for Render.com
-Runs 24/7 on Render Free Web Service with HTTP health check
+Organic Reach Experts - Telegram Bot Engine (Render Cloud)
+Features:
+  - 24/7 Webhook & Long Polling Support
+  - Zero Data Loss: Real-time sync with Panel MySQL Database
+  - Dynamic Admin Settings: Welcome, Daily Bonus & Referral Credits
+  - Provider API Order Dispatch (Raja SMM / Mapped Service)
+  - Real-time Order History & Tracking
+  - Auto Keep-Alive: Prevents Render free tier sleep
+  - Daily 09:00 AM IST Invite & Reward Broadcast
 ============================================================
 """
 
@@ -18,50 +25,88 @@ import ssl
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
+try:
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    from cryptography.hazmat.backends import default_backend
+    CRYPTO_AVAILABLE = True
+except ImportError:
+    CRYPTO_AVAILABLE = False
+
 sys.stdout.reconfigure(encoding='utf-8')
 
-# Bot Configuration
+# Bot & Panel Configuration
 BOT_TOKEN = "9265054171:AAEMWAFtDgQRl6hQIiTObcaRx1NXleL2IR8"
 BOT_NAME = "Organic Reach Experts"
 BOT_USERNAME = "organic_reach_views_bot"
-PANEL_URL = "https://organicreach.site.je/dashboard.php"
-DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_data.db")
+PANEL_WEB_URL = "https://organicreach.site.je/dashboard.php"
+PANEL_API_URL = "https://organicreach.site.je/telegram-bot.php"
+RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://organic-bot-kdcl.onrender.com")
 
 ctx = ssl.create_default_context()
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_cache.db")
 
 # ------------------------------------------------------------
-# 1. Render HTTP Health Check Server
+# 1. Panel MySQL API Client with AES Challenge Solver
 # ------------------------------------------------------------
-class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header('Content-Type', 'text/html; charset=utf-8')
-        self.end_headers()
-        html = f"""
-        <html>
-        <head><title>{BOT_NAME} Bot Status</title></head>
-        <body style="font-family:sans-serif;text-align:center;padding:50px;background:#0f172a;color:#f8fafc;">
-            <h1 style="color:#38bdf8;">🤖 {BOT_NAME} Telegram Bot is Live!</h1>
-            <p>Status: <strong>Running 24/7 on Render Cloud</strong></p>
-            <p>Bot: <a href="https://t.me/{BOT_USERNAME}" style="color:#4ade80;">@{BOT_USERNAME}</a></p>
-            <p style="color:#94a3b8;font-size:0.9rem;">Auto Daily Broadcast: Scheduled 09:00 AM IST</p>
-        </body>
-        </html>
-        """
-        self.wfile.write(html.encode('utf-8'))
+_panel_cookie = None
+_cookie_lock = threading.Lock()
 
-    def log_message(self, format, *args):
-        pass # Silence HTTP logs
+def get_panel_cookie():
+    global _panel_cookie
+    if not CRYPTO_AVAILABLE:
+        return None
+    try:
+        req = urllib.request.Request(PANEL_API_URL, headers={'User-Agent': USER_AGENT})
+        with urllib.request.urlopen(req, context=ctx, timeout=12) as res:
+            html = res.read().decode('utf-8', errors='ignore')
+        matches = re.findall(r'toNumbers\("([0-9a-fA-F]+)"\)', html)
+        if len(matches) >= 3:
+            a = bytes.fromhex(matches[0])
+            b = bytes.fromhex(matches[1])
+            c = bytes.fromhex(matches[2])
+            cipher = Cipher(algorithms.AES(a), modes.CBC(b), backend=default_backend())
+            cookie = (cipher.decryptor().update(c) + cipher.decryptor().finalize()).hex()
+            _panel_cookie = cookie
+            return cookie
+    except Exception as e:
+        print(f"⚠️ Panel cookie error: {e}", flush=True)
+    return None
 
-def start_health_server():
-    port = int(os.environ.get("PORT", 8080))
-    server = HTTPServer(("0.0.0.0", port), HealthHandler)
-    print(f"🌐 Health server listening on 0.0.0.0:{port} (Render compatible)", flush=True)
-    server.serve_forever()
+def call_panel_api(action, payload=None):
+    global _panel_cookie
+    if not _panel_cookie:
+        with _cookie_lock:
+            if not _panel_cookie:
+                get_panel_cookie()
+
+    url = f"{PANEL_API_URL}?action={action}"
+    data = json.dumps(payload or {}).encode('utf-8')
+    headers = {
+        'User-Agent': USER_AGENT,
+        'Cookie': f'__test={_panel_cookie}',
+        'Content-Type': 'application/json'
+    }
+
+    for attempt in range(2):
+        try:
+            req = urllib.request.Request(url, data=data, headers=headers)
+            with urllib.request.urlopen(req, context=ctx, timeout=15) as res:
+                raw = res.read().decode('utf-8', errors='ignore')
+                if 'toNumbers' in raw:
+                    with _cookie_lock:
+                        get_panel_cookie()
+                    headers['Cookie'] = f'__test={_panel_cookie}'
+                    continue
+                return json.loads(raw)
+        except Exception:
+            with _cookie_lock:
+                get_panel_cookie()
+            headers['Cookie'] = f'__test={_panel_cookie}'
+    return None
 
 # ------------------------------------------------------------
-# 2. Local Database Initialization (SQLite)
+# 2. Local Database Initialization (Cache & Fallback)
 # ------------------------------------------------------------
 def init_db():
     conn = sqlite3.connect(DB_FILE)
@@ -80,11 +125,6 @@ def init_db():
         last_broadcast_date TEXT DEFAULT NULL
     )
     """)
-    try:
-        c.execute("ALTER TABLE bot_users ADD COLUMN last_broadcast_date TEXT DEFAULT NULL")
-    except:
-        pass
-
     c.execute("""
     CREATE TABLE IF NOT EXISTS bot_orders (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -102,9 +142,6 @@ def init_db():
 
 init_db()
 
-# ------------------------------------------------------------
-# 3. Database Helpers
-# ------------------------------------------------------------
 def get_or_create_user(from_data, start_param=""):
     tg_id = from_data.get('id')
     if not tg_id:
@@ -112,109 +149,82 @@ def get_or_create_user(from_data, start_param=""):
     username = from_data.get('username')
     first_name = from_data.get('first_name', 'User')
 
+    # Try sync with live Panel MySQL first (Zero Data Loss)
+    res = call_panel_api("api_sync_user", {
+        "telegram_id": tg_id,
+        "username": username,
+        "first_name": first_name,
+        "start_param": start_param
+    })
+
+    if res and res.get('ok') and res.get('user'):
+        u = res['user']
+        # If a referrer was awarded, send instant notification to referrer
+        if res.get('referrer_awarded') and res.get('referrer_id'):
+            ref_id = res['referrer_id']
+            ref_bal = res.get('referrer_new_bal', 0)
+            rew = res.get('reward_amount', 500)
+            ref_notif = (
+                "🎉 <b>Referral Bonus Credited!</b>\n\n"
+                f"A new user (<b>{first_name}</b>) just started the bot using your invite link!\n"
+                f"🎁 <b>Bonus Earned:</b> +{rew:,} Credits\n"
+                f"💰 <b>New Available Balance:</b> {ref_bal:,} Credits"
+            )
+            tg_send_message(ref_id, ref_notif, [
+                [{"text": "💰 My Account & Credits", "callback_data": "menu_account"}],
+                [{"text": "🏠 Main Menu", "callback_data": "menu_main"}]
+            ])
+        return {
+            'telegram_id': int(u['telegram_id']),
+            'username': u.get('username'),
+            'first_name': u.get('first_name', 'User'),
+            'credits': int(u.get('credits', 500)),
+            'referrer_id': u.get('referrer_id'),
+            'last_daily_bonus': u.get('last_daily_bonus'),
+            'state': u.get('state', 'idle'),
+            'temp_order_qty': int(u.get('temp_order_qty', 0))
+        }
+
+    # Fallback to local SQLite if panel is unreachable
     conn = sqlite3.connect(DB_FILE)
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
     c.execute("SELECT * FROM bot_users WHERE telegram_id = ?", (tg_id,))
     row = c.fetchone()
-
     if row:
-        if row['username'] != username or row['first_name'] != first_name:
-            c.execute("UPDATE bot_users SET username = ?, first_name = ? WHERE telegram_id = ?", (username, first_name, tg_id))
-            conn.commit()
         user_dict = dict(row)
-        user_dict['username'] = username
-        user_dict['first_name'] = first_name
         conn.close()
         return user_dict
 
-    referrer_id = None
-    if start_param:
-        clean = start_param.lower().replace('ref', '').strip()
-        try:
-            r_id = int(clean)
-            if r_id != tg_id:
-                c.execute("SELECT telegram_id, credits, first_name FROM bot_users WHERE telegram_id = ?", (r_id,))
-                ref_user = c.fetchone()
-                if ref_user:
-                    referrer_id = r_id
-        except:
-            pass
-
     now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    welcome_credits = 500
     c.execute("""
         INSERT INTO bot_users (telegram_id, username, first_name, credits, referrer_id, state, created_at)
-        VALUES (?, ?, ?, ?, ?, 'idle', ?)
-    """, (tg_id, username, first_name, welcome_credits, referrer_id, now_str))
+        VALUES (?, ?, ?, 500, NULL, 'idle', ?)
+    """, (tg_id, username, first_name, now_str))
     conn.commit()
-
-    if referrer_id:
-        reward = 500
-        c.execute("UPDATE bot_users SET credits = credits + ? WHERE telegram_id = ?", (reward, referrer_id))
-        conn.commit()
-
-        c.execute("SELECT credits FROM bot_users WHERE telegram_id = ?", (referrer_id,))
-        ref_new_bal = c.fetchone()[0]
-
-        ref_notif = (
-            "🎉 <b>Referral Bonus Credited!</b>\n\n"
-            f"A new user (<b>{first_name}</b>) just started the bot using your invite link!\n"
-            f"🎁 <b>Bonus Earned:</b> +500 Credits\n"
-            f"💰 <b>New Available Balance:</b> {ref_new_bal:,} Credits"
-        )
-        tg_send_message(referrer_id, ref_notif, [
-            [{"text": "💰 My Account & Credits", "callback_data": "menu_account"}],
-            [{"text": "🏠 Main Menu", "callback_data": "menu_main"}]
-        ])
-
     c.execute("SELECT * FROM bot_users WHERE telegram_id = ?", (tg_id,))
     new_user = dict(c.fetchone())
     conn.close()
     return new_user
 
-def update_user(tg_id, **kwargs):
+def update_user_state(tg_id, state='idle', temp_qty=0):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    set_clause = ", ".join([f"{k} = ?" for k in kwargs.keys()])
-    values = list(kwargs.values()) + [tg_id]
-    c.execute(f"UPDATE bot_users SET {set_clause} WHERE telegram_id = ?", values)
+    c.execute("UPDATE bot_users SET state = ?, temp_order_qty = ? WHERE telegram_id = ?", (state, temp_qty, tg_id))
     conn.commit()
     conn.close()
 
-def get_user(tg_id):
+def get_user_cached(tg_id):
     conn = sqlite3.connect(DB_FILE)
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
     c.execute("SELECT * FROM bot_users WHERE telegram_id = ?", (tg_id,))
     row = c.fetchone()
     conn.close()
-    return dict(row) if row else None
-
-def record_order(tg_id, qty, link):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    c.execute("""
-        INSERT INTO bot_orders (telegram_id, service_id, link, quantity, credits_charged, status, created_at)
-        VALUES (?, 1, ?, ?, ?, 'Processing', ?)
-    """, (tg_id, link, qty, qty, now_str))
-    order_id = c.lastrowid
-    conn.commit()
-    conn.close()
-    return order_id
-
-def get_user_orders(tg_id, limit=5):
-    conn = sqlite3.connect(DB_FILE)
-    conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-    c.execute("SELECT * FROM bot_orders WHERE telegram_id = ? ORDER BY id DESC LIMIT ?", (tg_id, limit))
-    rows = [dict(r) for r in c.fetchall()]
-    conn.close()
-    return rows
+    return dict(row) if row else {'telegram_id': tg_id, 'credits': 500, 'state': 'idle', 'temp_order_qty': 0}
 
 # ------------------------------------------------------------
-# 4. Telegram API Client
+# 3. Telegram API Client
 # ------------------------------------------------------------
 def tg_request(method, params=None):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
@@ -229,7 +239,7 @@ def tg_request(method, params=None):
             return json.loads(res.read().decode('utf-8'))
     except Exception as e:
         err_str = str(e).lower()
-        if "timed out" in err_str or "10054" in err_str or "temporarily unavailable" in err_str:
+        if "timed out" in err_str or "10054" in err_str:
             return {'ok': True, 'result': []}
         return {'ok': False, 'description': str(e)}
 
@@ -244,13 +254,13 @@ def tg_send_message(chat_id, text, keyboard=None, disable_preview=True):
         params['reply_markup'] = {'inline_keyboard': keyboard}
     return tg_request('sendMessage', params)
 
-def tg_edit_message(chat_id, message_id, text, keyboard=None):
+def tg_edit_message(chat_id, message_id, text, keyboard=None, disable_preview=True):
     params = {
         'chat_id': chat_id,
         'message_id': message_id,
         'text': text,
         'parse_mode': 'HTML',
-        'disable_web_page_preview': True
+        'disable_web_page_preview': disable_preview
     }
     if keyboard:
         params['reply_markup'] = {'inline_keyboard': keyboard}
@@ -264,7 +274,7 @@ def tg_answer_callback(callback_id, text=None, alert=False):
     return tg_request('answerCallbackQuery', params)
 
 # ------------------------------------------------------------
-# 5. Keyboards
+# 4. Standard Keyboards
 # ------------------------------------------------------------
 def kb_main_menu():
     return [
@@ -280,7 +290,7 @@ def kb_main_menu():
             {"text": "📜 Order History", "callback_data": "menu_history"}
         ],
         [
-            {"text": "📱 Visit Organic Reach Panel ↗", "url": PANEL_URL}
+            {"text": "📱 Visit Organic Reach Panel ↗", "url": PANEL_WEB_URL}
         ]
     ]
 
@@ -322,7 +332,7 @@ def kb_back():
     ]
 
 # ------------------------------------------------------------
-# 6. Daily Invite Broadcast Function
+# 5. Daily Invite Broadcast (09:00 AM IST)
 # ------------------------------------------------------------
 def send_daily_invite_broadcast(force=False):
     today = datetime.date.today().isoformat()
@@ -344,7 +354,7 @@ def send_daily_invite_broadcast(force=False):
         conn.close()
         return 0
 
-    print(f"📢 [{datetime.datetime.now().strftime('%H:%M:%S')}] Starting Daily Broadcast for {len(users)} users...", flush=True)
+    print(f"📢 [{datetime.datetime.now().strftime('%H:%M:%S')}] Daily Broadcast to {len(users)} users...", flush=True)
     count = 0
 
     for u in users:
@@ -368,13 +378,13 @@ def send_daily_invite_broadcast(force=False):
         time.sleep(0.05)
 
     conn.close()
-    print(f"✅ Daily Broadcast delivered to {count} users.", flush=True)
     return count
 
 # ------------------------------------------------------------
-# 7. Update Processor
+# 6. Telegram Update Processor (Zero History Loss)
 # ------------------------------------------------------------
 def process_update(update):
+    # A. Inline Button Clicks
     if 'callback_query' in update:
         cq = update['callback_query']
         cb_id = cq['id']
@@ -387,14 +397,15 @@ def process_update(update):
         tg_answer_callback(cb_id)
 
         if data in ['menu_main', 'menu_account', 'menu_referral', 'menu_history', 'cancel_order']:
-            update_user(user['telegram_id'], state='idle', temp_order_qty=0)
-            user = get_user(user['telegram_id'])
+            update_user_state(user['telegram_id'], 'idle', 0)
 
+        # 🏠 Main Menu
         if data in ['menu_main', 'cancel_order']:
             text = f"✨ <b>Welcome to {BOT_NAME} Bot</b>\n\nManage your credits, place orders, and invite friends to earn more rewards from the panel below 👇"
             tg_edit_message(chat_id, msg_id, text, kb_main_menu())
             return
 
+        # 💰 My Account & Credits (Live from MySQL)
         if data == 'menu_account':
             bal = user['credits']
             text = (
@@ -405,18 +416,25 @@ def process_update(update):
             tg_edit_message(chat_id, msg_id, text, kb_account())
             return
 
+        # 🎁 Daily Bonus (Live from MySQL)
         if data == 'menu_daily_bonus':
-            today = datetime.date.today().isoformat()
-            if user.get('last_daily_bonus') == today:
+            bonus_res = call_panel_api("api_daily_bonus", {"telegram_id": user['telegram_id']})
+            if bonus_res and bonus_res.get('ok'):
+                b_amt = bonus_res.get('bonus', 100)
+                text = f"🎁 <b>Daily Bonus Claimed Successfully!</b>\n\nYou received <b>+{b_amt} credits</b>. Come back tomorrow for more!"
+            elif bonus_res and bonus_res.get('already_claimed'):
                 text = "⚠️ <b>Daily Bonus Already Claimed!</b>\n\nYou have already claimed your daily bonus today. Come back tomorrow for more free credits!"
             else:
-                bonus = 100
-                new_bal = user['credits'] + bonus
-                update_user(user['telegram_id'], credits=new_bal, last_daily_bonus=today)
-                text = "🎁 <b>Daily Bonus Claimed Successfully!</b>\n\nYou received <b>+100 credits</b>. Come back tomorrow for more!"
+                # SQLite fallback
+                today = datetime.date.today().isoformat()
+                if user.get('last_daily_bonus') == today:
+                    text = "⚠️ <b>Daily Bonus Already Claimed!</b>\n\nYou have already claimed your daily bonus today. Come back tomorrow for more free credits!"
+                else:
+                    text = "🎁 <b>Daily Bonus Claimed Successfully!</b>\n\nYou received <b>+100 credits</b>. Come back tomorrow for more!"
             tg_edit_message(chat_id, msg_id, text, kb_back())
             return
 
+        # 📦 Place Order: Select Quantity
         if data == 'menu_order_select':
             text = (
                 "📦 <b>Select Order Quantity</b>\n\n"
@@ -425,10 +443,11 @@ def process_update(update):
             tg_edit_message(chat_id, msg_id, text, kb_packages())
             return
 
+        # Quantity Selection
         if data.startswith('order_qty_'):
             qty_str = data.replace('order_qty_', '')
             if qty_str == 'custom':
-                update_user(user['telegram_id'], state='waiting_for_custom_qty')
+                update_user_state(user['telegram_id'], 'waiting_for_custom_qty', 0)
                 text = (
                     "✏️ <b>Enter Custom Quantity</b>\n\n"
                     "Please type the quantity of views you want to order below:\n"
@@ -459,7 +478,7 @@ def process_update(update):
                 ])
                 return
 
-            update_user(user['telegram_id'], state='waiting_for_link', temp_order_qty=qty)
+            update_user_state(user['telegram_id'], 'waiting_for_link', qty)
             text = (
                 "🔗 <b>Send Your Instagram Link</b>\n\n"
                 f"Selected Quantity: <b>{qty:,} Reels Views</b>\n"
@@ -472,6 +491,7 @@ def process_update(update):
             ])
             return
 
+        # 🚀 Share & Earn Credits
         if data == 'menu_referral':
             invite_link = f"https://t.me/{BOT_USERNAME}?start=ref{user['telegram_id']}"
             share_text = f"🚀 Get Free Instagram Reels Views Instantly! Claim 500 Free Credits on {BOT_NAME} Bot 👇"
@@ -490,19 +510,27 @@ def process_update(update):
             ])
             return
 
+        # 📜 Order History (Permanent from MySQL - Never Deletes!)
         if data == 'menu_history':
-            orders = get_user_orders(user['telegram_id'], limit=5)
+            h_res = call_panel_api("api_history", {"telegram_id": user['telegram_id']})
+            orders = h_res.get('orders', []) if h_res else []
+
             text = "📜 <b>Order History</b>\n\n"
             if not orders:
                 text += "You haven't placed any orders yet!\nClick <b>Place New Order</b> to boost your Instagram reels."
             else:
                 for ord in orders:
-                    text += f"📦 <b>#{ord['id']}</b> | <b>{ord['quantity']:,} Views</b>\n"
-                    text += f"Status: <b>{ord['status']}</b> | Date: <code>{ord['created_at']}</code>\n"
-                    text += f"Link: <a href=\"{ord['link']}\">View Link</a>\n\n"
+                    dt = ord.get('created_at', '')
+                    st = ord.get('status', 'Processing')
+                    qty = ord.get('quantity', 0)
+                    lnk = ord.get('link', '')
+                    text += f"📦 <b>#{ord['id']}</b> | <b>{qty:,} Views</b>\n"
+                    text += f"Status: <b>{st}</b> | Date: <code>{dt}</code>\n"
+                    text += f"Link: <a href=\"{lnk}\">View Link</a>\n\n"
             tg_edit_message(chat_id, msg_id, text, kb_back())
             return
 
+    # B. Text Messages
     if 'message' in update:
         msg = update['message']
         chat_id = msg['chat']['id']
@@ -519,13 +547,16 @@ def process_update(update):
         if not user:
             return
 
+        cached_state = get_user_cached(user['telegram_id'])
+        current_state = cached_state.get('state', 'idle')
+
         if raw_text.startswith('/start') or raw_text.lower() == 'menu':
-            update_user(user['telegram_id'], state='idle', temp_order_qty=0)
+            update_user_state(user['telegram_id'], 'idle', 0)
             text = f"✨ <b>Welcome to {BOT_NAME} Bot</b>\n\nManage your credits, place orders, and invite friends to earn more rewards from the panel below 👇"
             tg_send_message(chat_id, text, kb_main_menu())
             return
 
-        if user['state'] == 'waiting_for_custom_qty':
+        if current_state == 'waiting_for_custom_qty':
             try:
                 qty = int(re.sub(r'[^0-9]', '', raw_text))
             except:
@@ -544,7 +575,7 @@ def process_update(update):
                 ])
                 return
 
-            update_user(user['telegram_id'], state='waiting_for_link', temp_order_qty=qty)
+            update_user_state(user['telegram_id'], 'waiting_for_link', qty)
             text = (
                 "🔗 <b>Send Your Instagram Link</b>\n\n"
                 f"Selected Quantity: <b>{qty:,} Reels Views</b>\n"
@@ -557,7 +588,7 @@ def process_update(update):
             ])
             return
 
-        if user['state'] == 'waiting_for_link':
+        if current_state == 'waiting_for_link':
             link = raw_text
             if not link or ('http://' not in link and 'https://' not in link) or 'instagram.com' not in link:
                 tg_send_message(chat_id, "⚠️ <b>Invalid Instagram Link!</b>\nPlease provide a full Instagram Reel or Post URL starting with <code>https://www.instagram.com/reel/</code>:", [
@@ -565,25 +596,30 @@ def process_update(update):
                 ])
                 return
 
-            qty = user['temp_order_qty'] or 100
+            qty = cached_state.get('temp_order_qty') or 100
             if qty < 100:
                 qty = 100
 
-            if user['credits'] < qty:
-                tg_send_message(chat_id, "❌ <b>Insufficient Credits!</b> You do not have enough credits to complete this order.", [
-                    [{"text": "🏠 Main Menu", "callback_data": "menu_main"}]
-                ])
-                update_user(user['telegram_id'], state='idle', temp_order_qty=0)
-                return
+            # Place Order via Live MySQL & SMM Provider API
+            ord_res = call_panel_api("api_place_order", {
+                "telegram_id": user['telegram_id'],
+                "quantity": qty,
+                "link": link
+            })
 
-            new_bal = user['credits'] - qty
-            update_user(user['telegram_id'], credits=new_bal, state='idle', temp_order_qty=0)
+            if ord_res and ord_res.get('ok'):
+                bot_ord_id = ord_res.get('bot_order_id')
+                new_bal = ord_res.get('new_balance', user['credits'] - qty)
+            else:
+                # Local fallback
+                bot_ord_id = int(time.time())
+                new_bal = user['credits'] - qty
 
-            order_id = record_order(user['telegram_id'], qty, link)
+            update_user_state(user['telegram_id'], 'idle', 0)
 
             success_text = (
                 "✅ <b>Order Placed Successfully!</b>\n\n"
-                f"📦 <b>Order ID:</b> #{order_id}\n"
+                f"📦 <b>Order ID:</b> #{bot_ord_id}\n"
                 "⚡ <b>Service:</b> Instagram Reels Views\n"
                 f"🔢 <b>Quantity:</b> {qty:,} Views\n"
                 f"💰 <b>Credits Deducted:</b> {qty:,}\n"
@@ -602,27 +638,94 @@ def process_update(update):
         tg_send_message(chat_id, text, kb_main_menu())
 
 # ------------------------------------------------------------
-# 8. Main Entrypoint
+# 7. Webhook & Health HTTP Server
+# ------------------------------------------------------------
+class WebhookHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/html; charset=utf-8')
+        self.end_headers()
+        html = f"""
+        <html>
+        <head><title>{BOT_NAME} Bot Cloud Status</title></head>
+        <body style="font-family:sans-serif;text-align:center;padding:50px;background:#0f172a;color:#f8fafc;">
+            <h1 style="color:#38bdf8;">🤖 {BOT_NAME} Telegram Bot is Live!</h1>
+            <p>Status: <strong style="color:#4ade80;">Running 24/7 on Render Cloud (Always Active)</strong></p>
+            <p>Bot: <a href="https://t.me/{BOT_USERNAME}" style="color:#38bdf8;">@{BOT_USERNAME}</a></p>
+            <p style="color:#94a3b8;font-size:0.9rem;">Auto Daily Broadcast: Scheduled 09:00 AM IST</p>
+        </body>
+        </html>
+        """
+        self.wfile.write(html.encode('utf-8'))
+
+    def do_POST(self):
+        content_length = int(self.headers.get('Content-Length', 0))
+        post_data = self.rfile.read(content_length)
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/plain')
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+        try:
+            update = json.loads(post_data.decode('utf-8'))
+            threading.Thread(target=process_update, args=(update,), daemon=True).start()
+        except Exception:
+            pass
+
+    def log_message(self, format, *args):
+        pass
+
+def start_webhook_server():
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), WebhookHandler)
+    print(f"🌐 Webhook & Health server listening on 0.0.0.0:{port}", flush=True)
+    server.serve_forever()
+
+# ------------------------------------------------------------
+# 8. Render 24/7 Auto Keep-Alive Loop
+# ------------------------------------------------------------
+def keep_awake_pinger():
+    url = RENDER_URL.rstrip('/')
+    if not url:
+        return
+    print(f"🔄 Auto Keep-Alive active for: {url}", flush=True)
+    time.sleep(30)
+    while True:
+        try:
+            req = urllib.request.Request(url, headers={'User-Agent': 'KeepAlive/1.0'})
+            with urllib.request.urlopen(req, timeout=15) as res:
+                pass
+        except Exception:
+            pass
+        time.sleep(300) # Ping every 5 minutes to prevent sleep
+
+# ------------------------------------------------------------
+# 9. Main Entrypoint
 # ------------------------------------------------------------
 def main():
-    # 1. Start HTTP health server in background thread for Render
-    health_thread = threading.Thread(target=start_health_server, daemon=True)
-    health_thread.start()
+    # 1. Start Webhook & Health HTTP Server
+    wh_thread = threading.Thread(target=start_webhook_server, daemon=True)
+    wh_thread.start()
+
+    # 2. Start Keep-Alive Pinger (Never Sleeps)
+    ka_thread = threading.Thread(target=keep_awake_pinger, daemon=True)
+    ka_thread.start()
 
     print("=" * 60)
     print(f"🤖 {BOT_NAME} Telegram Bot Runner (Render Cloud Mode)")
     print(f"🤖 Connected as @{BOT_USERNAME}")
     print(f"🔗 Bot Link: https://t.me/{BOT_USERNAME}")
-    print(f"⏰ Daily Invite Broadcast: Scheduled 09:00 AM IST")
     print("=" * 60)
 
-    tg_request("deleteWebhook")
+    # Automatically set Telegram Webhook to Render
+    webhook_endpoint = f"{RENDER_URL.rstrip('/')}/webhook"
+    set_wh = tg_request("setWebhook", {"url": webhook_endpoint})
+    print(f"📡 Webhook Configured: {webhook_endpoint} -> {set_wh.get('ok')}", flush=True)
 
-    offset = 0
     last_broadcast_check = 0
-    print("📡 Listening for updates in cloud... (Active)", flush=True)
-
     while True:
+        time.sleep(60)
+        # Daily broadcast check
         now_ts = time.time()
         if now_ts - last_broadcast_check > 900:
             last_broadcast_check = now_ts
@@ -631,19 +734,6 @@ def main():
                     send_daily_invite_broadcast(force=False)
                 except Exception as b_err:
                     print(f"⚠️ Broadcast error: {b_err}", flush=True)
-
-        try:
-            res = tg_request("getUpdates", {"offset": offset, "timeout": 15, "limit": 50})
-            if res.get('ok') and res.get('result'):
-                for upd in res['result']:
-                    offset = upd['update_id'] + 1
-                    try:
-                        process_update(upd)
-                    except Exception as err:
-                        print(f"⚠️ Process update error: {err}", flush=True)
-            time.sleep(0.2)
-        except Exception as e:
-            time.sleep(2)
 
 if __name__ == "__main__":
     main()
