@@ -180,6 +180,7 @@ def init_db():
         last_daily_bonus TEXT,
         state TEXT DEFAULT 'idle',
         temp_order_qty INTEGER DEFAULT 0,
+        is_blocked INTEGER DEFAULT 0,
         created_at TEXT,
         last_broadcast_date TEXT DEFAULT NULL
     )
@@ -241,7 +242,8 @@ def get_or_create_user(from_data, start_param=""):
             'referrer_id': u.get('referrer_id'),
             'last_daily_bonus': u.get('last_daily_bonus'),
             'state': u.get('state', 'idle'),
-            'temp_order_qty': int(u.get('temp_order_qty', 0))
+            'temp_order_qty': int(u.get('temp_order_qty', 0)),
+            'is_blocked': int(u.get('is_blocked', 0))
         }
 
     # Fallback to local SQLite if panel is unreachable
@@ -266,21 +268,41 @@ def get_or_create_user(from_data, start_param=""):
     conn.close()
     return new_user
 
+USER_STATES = {}
+
 def update_user_state(tg_id, state='idle', temp_qty=0):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("UPDATE bot_users SET state = ?, temp_order_qty = ? WHERE telegram_id = ?", (state, temp_qty, tg_id))
-    conn.commit()
-    conn.close()
+    USER_STATES[tg_id] = {'state': state, 'temp_qty': temp_qty, 'time': time.time()}
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("""
+            INSERT INTO bot_users (telegram_id, state, temp_order_qty)
+            VALUES (?, ?, ?)
+            ON CONFLICT(telegram_id) DO UPDATE SET state = excluded.state, temp_order_qty = excluded.temp_order_qty
+        """, (tg_id, state, temp_qty))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        pass
 
 def get_user_cached(tg_id):
-    conn = sqlite3.connect(DB_FILE)
-    conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-    c.execute("SELECT * FROM bot_users WHERE telegram_id = ?", (tg_id,))
-    row = c.fetchone()
-    conn.close()
-    return dict(row) if row else {'telegram_id': tg_id, 'credits': 500, 'state': 'idle', 'temp_order_qty': 0}
+    if tg_id in USER_STATES:
+        st = USER_STATES[tg_id]
+        return {'telegram_id': tg_id, 'state': st.get('state', 'idle'), 'temp_order_qty': st.get('temp_qty', 0)}
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        c.execute("SELECT * FROM bot_users WHERE telegram_id = ?", (tg_id,))
+        row = c.fetchone()
+        conn.close()
+        if row:
+            d = dict(row)
+            USER_STATES[tg_id] = {'state': d.get('state', 'idle'), 'temp_qty': d.get('temp_order_qty', 0), 'time': time.time()}
+            return d
+    except Exception as e:
+        pass
+    return {'telegram_id': tg_id, 'credits': 500, 'state': 'idle', 'temp_order_qty': 0}
 
 # ------------------------------------------------------------
 # 3. Telegram API Client
@@ -455,6 +477,12 @@ def process_update(update):
         user = get_or_create_user(from_u)
         tg_answer_callback(cb_id)
 
+        # Check if user is blocked by admin
+        if user and user.get('is_blocked'):
+            tg_answer_callback(cb_id, "🚫 Aapka account admin dwara block kar diya gaya hai.", alert=True)
+            tg_send_message(chat_id, "🚫 <b>Account Blocked</b>\n\nAapka bot account admin dwara block kar diya gaya hai. Sahayata ke liye support se sampark karein.")
+            return
+
         if data in ['menu_main', 'menu_account', 'menu_referral', 'menu_history', 'cancel_order']:
             update_user_state(user['telegram_id'], 'idle', 0)
 
@@ -619,6 +647,11 @@ def process_update(update):
         if not user:
             return
 
+        # Check if user is blocked by admin
+        if user.get('is_blocked'):
+            tg_send_message(chat_id, "🚫 <b>Account Blocked</b>\n\nAapka bot account admin dwara block kar diya gaya hai. Sahayata ke liye support se sampark karein.")
+            return
+
         cached_state = get_user_cached(user['telegram_id'])
         current_state = cached_state.get('state', 'idle')
 
@@ -657,20 +690,41 @@ def process_update(update):
             ])
             return
 
-        if current_state == 'waiting_for_link':
-            link = raw_text
-            if not link or ('http://' not in link and 'https://' not in link) or 'instagram.com' not in link:
+        # Auto-detect Instagram link
+        has_ig_link = False
+        extracted_link = None
+        for chunk in raw_text.split():
+            if 'instagram.com' in chunk or 'instagr.am' in chunk:
+                has_ig_link = True
+                extracted_link = chunk
+                if not extracted_link.startswith('http://') and not extracted_link.startswith('https://'):
+                    extracted_link = 'https://' + extracted_link
+                break
+
+        if current_state == 'waiting_for_link' or has_ig_link:
+            link = extracted_link or raw_text.strip()
+            if not link or ('http://' not in link and 'https://' not in link) or ('instagram.com' not in link and 'instagr.am' not in link):
                 tg_send_message(chat_id, "⚠️ <b>Invalid Instagram Link!</b>\nPlease provide a full Instagram Reel or Post URL starting with <code>https://www.instagram.com/reel/</code>:", [
                     [{"text": "❌ Cancel", "callback_data": "cancel_order"}]
                 ])
                 return
 
-            qty = cached_state.get('temp_order_qty') or 100
+            qty = cached_state.get('temp_order_qty') or 0
             if qty < 100:
-                qty = 100
+                qty = 500 if user['credits'] >= 500 else (100 if user['credits'] >= 100 else 100)
 
-            # 1. Intermediate status message (Exact match to Image 1)
-            tg_send_message(chat_id, "⏳ Processing your order with API, please wait...")
+            if user['credits'] < qty:
+                if user['credits'] >= 100:
+                    qty = 100
+                else:
+                    tg_send_message(chat_id, f"❌ <b>Insufficient Credits!</b>\n\nYou need at least <b>100 credits</b> to place an order, but your available balance is <b>{user['credits']:,} credits</b>.\n\nPlease earn free credits by claiming your Daily Bonus or inviting friends:", [
+                        [{"text": "🎁 Daily Bonus", "callback_data": "menu_daily_bonus"}, {"text": "🚀 Share & Earn Credits", "callback_data": "menu_referral"}],
+                        [{"text": "❌ Cancel", "callback_data": "cancel_order"}]
+                    ])
+                    return
+
+            # 1. Immediate status message
+            tg_send_message(chat_id, f"⏳ <b>Placing order for {qty:,} Views...</b>\nDispatching to API, please wait...")
 
             # 2. Dispatch directly to Provider API (ig grow bot / SMM Raja)
             prov_res = call_provider_api(link, qty)
@@ -694,19 +748,21 @@ def process_update(update):
 
             update_user_state(user['telegram_id'], 'idle', 0)
 
-            # 4. Exact success receipt and buttons matching Image 1
+            # 4. Exact success receipt
             success_text = (
                 "✅ <b>Order Placed Successfully!</b>\n\n"
-                f"🆔 <b>Order ID:</b> <code>{bot_ord_id}</code>\n"
-                f"📦 <b>Quantity:</b> {qty:,} views\n\n"
-                "🔥 Want a faster experience? Manage your orders and earn more credits directly on our Android App!"
+                f"📦 <b>Order ID:</b> <code>#{bot_ord_id}</code>\n"
+                f"🚀 <b>Service:</b> Instagram Reels Views\n"
+                f"👁 <b>Quantity:</b> {qty:,} views\n"
+                f"🔗 <b>Target:</b> <a href=\"{link}\">View Reel</a>\n"
+                f"⚡ <b>Status:</b> <b>Processing</b>\n\n"
+                "🎉 <i>Your views are on their way! Check status anytime in 'Order History'.</i>"
             )
             tg_send_message(chat_id, success_text, [
-                [{"text": "🛒 Buy More on Organic Reach Panel ↗", "url": PANEL_WEB_URL}],
-                [{"text": "📦 Place Another Order", "callback_data": "menu_order_select"}, {"text": "🏠 Main Menu", "callback_data": "menu_main"}]
+                [{"text": "🛍 Place Another Order", "callback_data": "menu_order_select"}, {"text": "📜 Order History", "callback_data": "menu_history"}],
+                [{"text": "🏠 Main Menu", "callback_data": "menu_main"}]
             ])
             return
-
         text = f"✨ <b>Welcome to {BOT_NAME} Bot</b>\n\nManage your credits, place orders, and invite friends to earn more rewards from the panel below 👇"
         tg_send_message(chat_id, text, kb_main_menu())
 
